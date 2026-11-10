@@ -1,0 +1,167 @@
+name: 模型接口诊断
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe_model:
+        description: '发起一次最多 32 个输出 token 的模型请求（可能消耗 API 额度）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llm-api-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: 检查网络、鉴权与模型响应
+        id: diagnose
+        shell: python
+        env:
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LITELLM_MODEL: ${{ vars.LITELLM_MODEL || secrets.LITELLM_MODEL }}
+          PROBE_MODEL: ${{ inputs.probe_model }}
+        run: |
+          import json
+          import os
+          import socket
+          import sys
+          import time
+          from http.client import HTTPException
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlsplit
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, request, response, code, message, headers, new_url):
+                  return None
+
+          def emit(message):
+              print(message, flush=True)
+              summary = os.getenv("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as output:
+                      output.write(f"- {message}\n")
+
+          def probe(label, url, headers=None, payload=None, timeout=20):
+              status = 0
+              result = None
+              problem = "none"
+              started = time.monotonic()
+              data = json.dumps(payload).encode("utf-8") if payload is not None else None
+              request = Request(url, data=data, headers=headers or {})
+              try:
+                  with build_opener(NoRedirect()).open(request, timeout=timeout) as response:
+                      status = response.status
+                      body = response.read(524289)
+                      if len(body) > 524288:
+                          problem = "response_too_large"
+                      else:
+                          try:
+                              result = json.loads(body)
+                          except (ValueError, UnicodeError):
+                              problem = "non_json_response"
+              except HTTPError as error:
+                  status = error.code
+                  error.close()
+              except URLError as error:
+                  problem = type(error.reason).__name__
+              except (OSError, HTTPException, ValueError, UnicodeError) as error:
+                  problem = type(error).__name__
+              emit(
+                  f"{label}: HTTP {status}; "
+                  f"elapsed={time.monotonic() - started:.2f}s; transport={problem}"
+              )
+              return status, result
+
+          def main():
+              base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+              key = os.getenv("OPENAI_API_KEY", "").strip()
+              model = os.getenv("LITELLM_MODEL", "").strip().removeprefix("openai/")
+              try:
+                  parsed = urlsplit(base)
+                  valid_url = (
+                      parsed.scheme == "https"
+                      and bool(parsed.hostname)
+                      and not any(character.isspace() for character in base)
+                      and parsed.username is None
+                      and parsed.password is None
+                      and not parsed.query
+                      and not parsed.fragment
+                  )
+              except ValueError:
+                  valid_url = False
+              if not valid_url or not key or not model:
+                  emit(
+                      "FAIL: require an HTTPS base URL without embedded credentials/query/fragment, "
+                      "an API key, and a model ID."
+                  )
+                  return 1
+
+              started = time.monotonic()
+              try:
+                  socket.getaddrinfo(parsed.hostname, parsed.port or 443)
+              except (OSError, ValueError) as error:
+                  emit(f"DNS: FAIL; transport={type(error).__name__}")
+                  return 1
+              emit(f"DNS: PASS; elapsed={time.monotonic() - started:.2f}s")
+
+              status, _ = probe("Unauthenticated network", base + "/models")
+              if status not in (200, 401, 403):
+                  emit(
+                      "FAIL: network/base-path check did not reach the expected API endpoint; "
+                      "redirects are not followed."
+                  )
+                  return 1
+
+              headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+              status, models = probe("Authenticated model list", base + "/models", headers=headers)
+              if (
+                  status != 200
+                  or not isinstance(models, dict)
+                  or not isinstance(models.get("data"), list)
+              ):
+                  emit(
+                      "FAIL: authenticated model discovery did not succeed; "
+                      "check access permissions, key, and gateway health."
+                  )
+                  return 1
+              visible = any(isinstance(item, dict) and item.get("id") == model for item in models["data"])
+              emit("Configured model listed: " + ("yes" if visible else "no (verify the gateway model ID)"))
+
+              if os.getenv("PROBE_MODEL", "false").lower() != "true":
+                  emit("Model generation: NOT TESTED; network/authentication only. No stock analysis was run.")
+                  return 0
+
+              payload = {
+                  "model": model,
+                  "messages": [{"role": "user", "content": "Reply with OK only."}],
+                  "max_tokens": 32,
+                  "stream": False,
+              }
+              status, response = probe(
+                  "Minimal model request", base + "/chat/completions",
+                  headers=headers, payload=payload, timeout=60,
+              )
+              if status != 200 or not isinstance(response, dict) or not response.get("choices"):
+                  emit(
+                      "FAIL: no valid model response within the diagnostic request budget; "
+                      "inspect the gateway/upstream logs."
+                  )
+                  return 1
+              emit("PASS: minimal model response received. Full stock analysis and streaming remain unverified.")
+              return 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
